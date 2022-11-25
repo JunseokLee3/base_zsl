@@ -65,8 +65,11 @@ def do_train(
     proto_align_losses = []
     scale_all = []
     start_epoch = 0
+    max_epoch =100
+    print('maxepoch : ',max_epoch )
     if resume_from is not None:
-        checkpoint = torch.load(resume_from,map_location=torch.device('cpu'))
+        print('model_file_path : ', model_file_path)
+        checkpoint = torch.load(model_file_path,map_location=torch.device('cpu'))
         # print(len(checkpoint['optimizer_state_dict']))
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'][0])
         model.load_state_dict(checkpoint['model_state_dict'])

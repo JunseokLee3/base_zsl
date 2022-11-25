@@ -70,6 +70,7 @@ def train_model(cfg, local_rank, distributed, seed=214):
     output_dir = cfg.OUTPUT_DIR
     model_file_name = cfg.MODEL_FILE_NAME
     model_file_path = join(output_dir, model_file_name)
+    print('model_file_path :' , model_file_path)
 
     test_gamma = cfg.TEST.GAMMA
     max_epoch = cfg.SOLVER.MAX_EPOCH

@@ -11,11 +11,18 @@ def cal_accuracy(model, dataloadr, att, test_id, device, bias=None):
     for iteration, (img, label) in enumerate(dataloadr):
         img = img.to(device)
         score = model(img, seen_att=att)
+        # score size : torch.Size([100, 200]) [batch size, class]
+        
         scores.append(score)
         labels.append(label)
 
+    
+    
     scores = torch.cat(scores, dim=0)
     labels = torch.cat(labels, dim=0)
+    # czsl unseen AFTER concat(scores )size:  torch.Size([742, 50])
+    # gzsl unseen AFTER concat(scores )size:  torch.Size([742, 200])
+    # gzsl unseen AFTER concat(scores )size:  torch.Size([441, 200])
 
     if bias is not None:
         scores = scores-bias
