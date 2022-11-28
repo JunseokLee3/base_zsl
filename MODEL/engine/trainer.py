@@ -54,6 +54,7 @@ def do_train(
 
     att_seen = res['att_seen'].to(device)
     att_unseen = res['att_unseen'].to(device)
+    attribute = res['attribute'].to(device)
 
     losses = []
     cls_losses = []

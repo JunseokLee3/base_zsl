@@ -127,7 +127,8 @@ def build_dataloader(cfg, is_distributed=False):
         'test_id': test_id,
         'train_test_id': train_test_id,
         'train_clsname': train_clsname,
-        'test_clsname': test_clsname
+        'test_clsname': test_clsname,
+        'attribute' : attribute
     }
     # print(att_unseen,att_seen)
     num_gpus = get_world_size()

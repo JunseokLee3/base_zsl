@@ -41,7 +41,7 @@ SOLVER:
   WEIGHT_DECAY: 1e-5
   MOMENTUM: 0.9
   GAMMA: 0.5
-  STEPS: 10
+  STEPS: 50
   # DATA_AUG: "resize_only"
   DATA_AUG: "resize_random_crop"
 
