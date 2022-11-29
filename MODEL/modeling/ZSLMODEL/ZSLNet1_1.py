@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops.layers.torch import Rearrange
 
 from MODEL.modeling.backbone import resnet101_features,ViT
 import MODEL.modeling.utils as utils
@@ -17,28 +18,19 @@ from copy import deepcopy
 import random
 import matplotlib.pyplot as plt
 import os
-from einops.layers.torch import Rearrange
-import yaml
-import numpy as np
-
-from MODEL.data import build_dataloader
-
 base_architecture_to_features = {
     'resnet101': resnet101_features,
 }
 
-# first I tried to attention 
+# Transzero + feature extractor combination.
+# I only use CE s2v
 
 class ZSLNet(nn.Module):
     def __init__(self, backbone, img_size, c, w, h,
-                 attribute_num, cls_num, ucls_num, attr_group,attribute, w2v, dataset_name,config,
-                 scale=20.0, device=None,cfg=None ):
+                 attribute_num, cls_num, ucls_num, attr_group, w2v, dataset_name,
+                 scale=20.0, device=None,cfg=None):
 
         super(ZSLNet, self).__init__()
-        ##      
-        self.config = config
-        ##
-
         self.device = device
         self.img_size = img_size
         self.attribute_num = attribute_num
@@ -52,8 +44,6 @@ class ZSLNet(nn.Module):
         self.cls_num = cls_num
         self.attr_group = attr_group
         self.att_assign = {}
-        self.attribute = attribute
-        self.w2v = w2v
         for key in attr_group:
             for att in attr_group[key]:
                 self.att_assign[att] = key - 1
@@ -106,9 +96,8 @@ class ZSLNet(nn.Module):
 
         self.memory_max_size = 1024
         out_channel = self.part_num
-        #layers 
+        #layers
         out_channel1 = 300
-
         self.extract_1 =  torch.nn.Conv2d(256, out_channel1, kernel_size=8, stride=8)
         self.extract_2 = torch.nn.Conv2d(512, out_channel1, kernel_size=4, stride=4)
         self.extract_3 = torch.nn.Conv2d(1024, out_channel1, kernel_size=2, stride=2)
@@ -135,9 +124,10 @@ class ZSLNet(nn.Module):
         self.scale_semantic = cfg.MODEL.SCALE_SEMANTIC
         self.episilon = 0.1
         self.memory_max_size = 512
-        #        
-        self.transzero = TransZero(self.config, self.attribute, self.w2v).to(self.device)
 
+        ###
+        self.w2v = w2v
+        self.transzero = TransZero( self.w2v).to(self.device)
 
 
     def conv_features(self, x):
@@ -146,6 +136,7 @@ class ZSLNet(nn.Module):
         '''
         x = self.backbone(x)
         return x
+
 
 
     def attentionModule(self, x,seen_att):
@@ -181,7 +172,7 @@ class ZSLNet(nn.Module):
         # 8 300 196 , 8 2048 196 -> 8 300 2048
 
         out_package = self.transzero(parts_map)
-        tran_out = out_package['emed']
+        tran_out = out_package['embed']
         # embed : torch.size([8,312])
         visual_score = tran_out @ seen_att_normalized.T * self.scale_semantic
 
@@ -246,47 +237,46 @@ class ZSLNet(nn.Module):
 
         return loss_dict
 
-
 class TransZero(nn.Module):
-    def __init__(self, config, att, init_w2v_att,
+    def __init__(self, init_w2v_att,
                  is_bias=True, bias=1, is_conservative=True):
-        super(TransZero, self).__init__()
-        self.config = config
-        self.dim_f = config['dim_f']['value']
-        self.dim_v = config['dim_v']['value']
-        self.nclass = config['num_class']['value']
+        super(TransZero, self).__init__()        
+        self.dim_f = 2048
+        self.dim_v = 300
+        self.nclass = 200
 
         self.is_bias = False
         self.is_conservative = is_conservative
         # class-level semantic vectors
-        self.att = nn.Parameter(F.normalize(att), requires_grad=False)
+        # self.att = nn.Parameter(F.normalize(att), requires_grad=False)
         # dataloader.att(size) : torch.Size([200, 312])
 
         # GloVe features for attributes name
+        init_w2v_att = torch.from_numpy(init_w2v_att).float()
         self.V = nn.Parameter(F.normalize(init_w2v_att), requires_grad=True)
 
         # mapping
         self.W_1 = nn.Parameter(nn.init.normal_(
             torch.empty(300, 300)), requires_grad=True)
-
+        
             
         # transformer
         self.transformer = Transformer(
-            ec_layer=config['tf_ec_layer']['value'],
-            dc_layer=config['tf_dc_layer']['value'],
-            dim_com=config['tf_common_dim']['value'],
-            dim_feedforward=config['tf_dim_feedforward']['value'],
-            dropout=config['tf_dropout']['value'],
-            SAtt=config['tf_SAtt']['value'],
-            heads=config['tf_heads']['value'],
-            aux_embed=config['tf_aux_embed']['value'])
+            ec_layer=1,
+            dc_layer=1,
+            dim_com=300,
+            dim_feedforward=512,
+            dropout=0.4,
+            SAtt=True,
+            heads=1,
+            aux_embed=False)
         # for loss computation
         self.log_softmax_func = nn.LogSoftmax(dim=1)
         self.weight_ce = nn.Parameter(torch.eye(self.nclass), requires_grad=False)
         self.CLS_loss = nn.CrossEntropyLoss()
         self.layer_se = nn.Sequential(nn.AdaptiveAvgPool1d(1),
             Rearrange('... () -> ...'),
-            nn.Linear(config['tf_common_dim']['value'], self.nclass))
+            nn.Linear(300, self.nclass))
 
     def forward(self, input, from_img=False):
         Fs = input
@@ -306,7 +296,7 @@ class TransZero(nn.Module):
             Fs = Fs.reshape(shape[0], shape[1], shape[2] * shape[3])
         Fs = F.normalize(Fs, dim=1)
         # attributes
-        V_n = F.normalize(self.V) if self.config.normalize_V else self.V
+        V_n = F.normalize(self.V) 
         # locality-augmented visual features
         Trans_out, Trans_vis = self.transformer(Fs, V_n)
         # embedding to semantic space
@@ -372,7 +362,6 @@ class TransZero(nn.Module):
         out_package = {'loss': loss, 'loss_CE': loss_CE,
                         'loss_reg': loss_reg , 'loss_CE_Ve' : loss_CE_Ve}
         return out_package
-
 
 class Transformer(nn.Module):
     def __init__(self, ec_layer=1, dc_layer=1, dim_com=300,
@@ -603,6 +592,7 @@ class ScaledDotProductGeometryAttention(nn.Module):
 
     def forward(self, queries, keys, values, box_relation_embed_matrix,
                 attention_mask=None, attention_weights=None):
+
         b_s, nq = queries.shape[:2]
         nk = keys.shape[1]
         q = self.fc_q(queries).view(b_s, nq, self.h,
@@ -783,9 +773,6 @@ def build_ZSLNet(cfg):
 
     img_size = cfg.DATASETS.IMAGE_SIZE
 
-    cofig_path = 'config/CUB_GZSL.yaml'
-    with open(cofig_path) as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
 
     c,w,h = 2048, img_size//32, img_size//32
 
@@ -799,22 +786,17 @@ def build_ZSLNet(cfg):
 
     w2v_file = dataset_name+"_attribute.pkl"
     w2v_path = join(cfg.MODEL.ATTENTION.W2V_PATH, w2v_file)
-    
-    _, _, _, res = build_dataloader(cfg, is_distributed=True)
+
 
     with open(w2v_path, 'rb') as f:
-        w2v = pickle.load(f)    
-    
+        w2v = pickle.load(f)
+    # w2v = None
 
     device = torch.device(cfg.MODEL.DEVICE)
-    w2v = torch.from_numpy(w2v).float().to(device)
-    
-    attribute = res['attribute']
-    attribute =torch.from_numpy(attribute).float().to(device)
 
     return ZSLNet(backbone=res101, img_size=img_size,
                   c=c, w=w, h=h, scale=scale,
                   attribute_num=attribute_num,
-                  attr_group=attr_group, attribute = attribute, w2v=w2v,dataset_name=dataset_name,config=config,
+                  attr_group=attr_group, w2v=w2v,dataset_name=dataset_name,
                   cls_num=cls_num, ucls_num=ucls_num,
                   device=device,cfg=cfg)

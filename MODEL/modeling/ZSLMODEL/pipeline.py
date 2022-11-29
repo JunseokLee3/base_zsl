@@ -1,4 +1,4 @@
-from .ZSLNet import build_ZSLNet
+from .ZSLNet2_2 import build_ZSLNet
 from .ZSLNet_VIT import build_ZSLNet_VIT
 
 _ZSL_META_ARCHITECTURES = {

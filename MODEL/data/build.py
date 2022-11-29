@@ -56,7 +56,7 @@ def build_dataloader(cfg, is_distributed=False):
     for img_file in img_files:
         img_path = img_file[0]
         if dataset=='CUB':
-            img_path = join(imgroot, '/'.join(img_path.split('/')[6:]))
+            img_path = join(imgroot, '/'.join(img_path.split('/')[6:]))                      
         elif dataset=='AwA2':
             eff_path = img_path.split('/')[5:]
             eff_path.remove('')
@@ -68,7 +68,7 @@ def build_dataloader(cfg, is_distributed=False):
             img_path = join(imgroot,'/'.join(img_path.split('/')[7:]))
         new_img_files.append(img_path)
 
-    new_img_files = np.array(new_img_files)
+    new_img_files = np.array(new_img_files)    
     label = matcontent['labels'].astype(int).squeeze() - 1
     matcontent = io.loadmat(dataroot + "/" + dataset + "/" + class_embedding + "_splits.mat")
     trainvalloc = matcontent['trainval_loc'].squeeze() - 1
@@ -159,7 +159,7 @@ def build_dataloader(cfg, is_distributed=False):
 
     elif cfg.DATALOADER.MODE == 'episode':
         n_batch = cfg.DATALOADER.N_BATCH
-        ep_per_batch = cfg.DATALOADER.EP_PER_BATCH
+        ep_per_batch = cfg.DATALOADER.EP_PER_BATCH        
         dataset = EpiDataset(train_img, train_att, train_label, transforms)
         if not is_distributed:
             sampler = CategoriesSampler(

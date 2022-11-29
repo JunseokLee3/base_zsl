@@ -15,7 +15,7 @@ class EpiDataset(data.Dataset):
         self.transforms = transforms
 
     def __getitem__(self, index):
-        img_path = self.img_path[index]
+        img_path = self.img_path[index]        
         img = Image.open(img_path).convert('RGB')
         if self.transforms is not None:
             img = self.transforms(img)

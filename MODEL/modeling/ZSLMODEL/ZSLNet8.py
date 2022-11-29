@@ -21,6 +21,9 @@ base_architecture_to_features = {
     'resnet101': resnet101_features,
 }
 
+# drop out and alpha 0.01
+# i just use the key attention (bi -directional attention)
+
 class ZSLNet(nn.Module):
     def __init__(self, backbone, img_size, c, w, h,
                  attribute_num, cls_num, ucls_num, attr_group, w2v, dataset_name,
@@ -120,6 +123,18 @@ class ZSLNet(nn.Module):
         self.episilon = 0.1
         self.memory_max_size = 512
 
+        self.dropout = nn.Dropout(0.4)
+
+        self.layer_cal1 = nn.Linear(2048, 312)
+        self.layer_cal2 = nn.Linear(312,2048)
+
+        nn.init.xavier_uniform_(self.layer_cal1.weight)
+        nn.init.constant_(self.layer_cal1.bias,0)
+        nn.init.xavier_uniform_(self.layer_cal2.weight)
+        nn.init.constant_(self.layer_cal2.bias,0)
+
+        
+
 
     def conv_features(self, x):
         '''
@@ -194,7 +209,30 @@ class ZSLNet(nn.Module):
         # seen_att_normalized.size() torch.Size([150, 312])
         parts_map = self.extract_1(x1) + self.extract_2(x2) + self.extract_3(x3) + self.extract_4(x4)
         # parts_map size: torch.Size([8, 312, 14, 14])
+        parts_map_flatten1 = parts_map.reshape(N,-1,W*H).softmax(dim=1)
+        # parts_map_flatten1 size : torch.Size([8, 312, 196])
+        x5_1 = x4.reshape(N,C,-1)
+        # x4 size : torch.Size([8, 2048, 14, 14])
+        # x5_1 size : torch.Size([8, 2048, 196]))
+        ############
 
+        
+        # part_feats_si size() :  torch.Size([8, 2048, 312])
+        # part_feats_si.size()[2] : 150
+        q = parts_map_flatten1 # torch.Size([8, 312, 196])
+        k = x5_1.permute(0,2,1) # torch.Size([8, 2048, 196])) -> torch.Size([8, 196 ,2048]))
+        k = self.layer_cal1(k) # torch.Size([8, 196 ,312]
+        v = parts_map_flatten1  # torch.Size([8, 312, 196])
+   
+        att = torch.matmul(q,k) # torch.Size([8, 312, 312])                
+        att = torch.softmax(att, -1)
+        parts_map_2 = torch.matmul(att,v )  # torch.Size([8, 312, 196]))
+        parts_map_1 = parts_map_2.reshape(N, 312, W,H)
+        parts_map = 0.01*self.dropout(parts_map_1) + parts_map
+        
+
+
+        ############
       
         global_semantic_feat = F.avg_pool2d(parts_map, kernel_size=(W, H)).squeeze()
         # global_semantic_feat size : torch.Size([8, 312])
@@ -202,6 +240,23 @@ class ZSLNet(nn.Module):
         # self.global_semantic_feat size : torch.Size([8, 312])
         semantic_score = self.global_semantic_feat @ seen_att_normalized.T * self.scale_semantic
         # semantic_score size : torch.Size([8, 150])
+
+        #############
+        # parts_map_2 # torch.Size([8, 312, 196]))
+        # x5_1 size : torch.Size([8, 2048, 196]))
+        parts_map_flatten2 = parts_map.reshape(N,-1,W*H).softmax(dim=1)
+        q_1 = x5_1 # torch.Size([8, 2048, 196]))
+        k_1 = parts_map_flatten2.permute(0,2,1) # torch.Size([8, 312, 196])) -> torch.Size([8, 196 ,312]))
+        k_1 = self.layer_cal2(k_1) # torch.Size([8, 196 ,2048])
+        v_1 = x5_1  # torch.Size([8, 2048, 196]))
+
+        att_1 = torch.matmul(q_1,k_1) # torch.Size([8, 2048, 2048])                
+        att_1 = torch.softmax(att_1, -1)
+        parts_map_1 = torch.matmul(att_1,v_1 )  # torch.Size([8, 2048, 196]))
+        x4_1 = parts_map_1.reshape(N, C, W, H)
+        x4 =  0.01*self.dropout(x4_1) + x4
+        
+        ############
 
 
         global_feat = F.avg_pool2d(x4, kernel_size=(W, H)).squeeze()
@@ -251,7 +306,6 @@ class ZSLNet(nn.Module):
         self.iters += 1
         feat = self.conv_features(x)
         part_feats, visual_score, global_feat, semantic_score, cls_proto, atten_map, global_atten_map = self.attentionModule(feat,seen_att)
-        print('att.size() : ', att.size())
        
         if not self.training:
             return visual_score
@@ -264,17 +318,12 @@ class ZSLNet(nn.Module):
         Lad = torch.tensor(0).float().to(self.device)
     
         part_filter = self.att_weight&att_binary.bool()
-        print('part_filter.size :' ,part_filter.size())
         part_feats = F.normalize(part_feats, dim=-1)
         # part_feates size() :  torch.Size([8, 312, 2048])
         att_proto = self.proto_model(F.normalize(self.attribute_vector,-1) * np.sqrt(self.part_num), False)
         # att_proto size() :  torch.Size([312, 2048])
         att_proto = F.normalize(att_proto,dim=-1)
        
-        
-        # part_filter.sum() : tensor(1, device='cuda:0')
-        # part_filter.sum() : tensor(3, device='cuda:3')
-
         if part_filter.sum()>0:
             attr_proto_dist = torch.cat([cosine_distance(part_feat, att_proto).unsqueeze(0) for part_feat in part_feats],dim=0)
             # attr_proto_dist size() :  torch.Size([8, 312, 312])
@@ -284,9 +333,7 @@ class ZSLNet(nn.Module):
             pos_dists = attr_proto_dist.gather(2,index_pos).squeeze()
             neg_dists = attr_proto_dist.gather(2,index_neg).squeeze()
             L_proto += F.relu(pos_dists - self.alpha*neg_dists.min(dim=-1)[0]  + self.beta)[part_filter].mean()
-        
-        # self.part_num : 312
-        # self.attribute_num: 312
+
         if self.part_num > self.attribute_num:
             att[:,-1] = 0.1
 
@@ -300,13 +347,6 @@ class ZSLNet(nn.Module):
         # part_label size: torch.Size([0])
         # part_label size: torch.Size([3])    
         # part_label size: torch.Size([2])
-
-
-        # len(part_label) :  1
-        # len(part_label) :  3
-
-        # plen(torch.unique(part_label)) :  1
-        # len(torch.unique(part_label)) :  2
 
         if len(part_label)>0 and len(torch.unique(part_label)) != len(part_label):
             contrastive_embeddings = F.normalize(self.contrastive_embedding(part_feats),dim=-1)

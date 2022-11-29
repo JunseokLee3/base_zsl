@@ -54,7 +54,7 @@ def do_train(
 
     att_seen = res['att_seen'].to(device)
     att_unseen = res['att_unseen'].to(device)
-    attribute = res['attribute'].to(device)
+    
 
     losses = []
     cls_losses = []
@@ -107,6 +107,7 @@ def do_train(
 
         scheduler.step()
         for iteration, (batch_img, batch_att, batch_label) in enumerate(tr_dataloader):
+            
             batch_img = batch_img.to(device)
             batch_att = batch_att.to(device)
             batch_label = batch_label.to(device)
@@ -158,6 +159,7 @@ def do_train(
             proto_loss_epoch.append(l_proto.item())
             proto_align_loss_epoch.append(l_proto_align.item())
             scale_epoch.append(scale)
+        
 
         if is_main_process():
             losses += loss_epoch

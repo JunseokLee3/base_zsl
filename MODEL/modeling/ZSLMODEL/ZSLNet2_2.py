@@ -17,28 +17,19 @@ from copy import deepcopy
 import random
 import matplotlib.pyplot as plt
 import os
-from einops.layers.torch import Rearrange
-import yaml
-import numpy as np
-
-from MODEL.data import build_dataloader
-
 base_architecture_to_features = {
     'resnet101': resnet101_features,
 }
 
-# first I tried to attention 
+# first I tried to attention
+# i add the regression 
 
 class ZSLNet(nn.Module):
     def __init__(self, backbone, img_size, c, w, h,
-                 attribute_num, cls_num, ucls_num, attr_group,attribute, w2v, dataset_name,config,
-                 scale=20.0, device=None,cfg=None ):
+                 attribute_num, cls_num, ucls_num, attr_group, w2v, dataset_name,
+                 scale=20.0, device=None,cfg=None):
 
         super(ZSLNet, self).__init__()
-        ##      
-        self.config = config
-        ##
-
         self.device = device
         self.img_size = img_size
         self.attribute_num = attribute_num
@@ -52,8 +43,6 @@ class ZSLNet(nn.Module):
         self.cls_num = cls_num
         self.attr_group = attr_group
         self.att_assign = {}
-        self.attribute = attribute
-        self.w2v = w2v
         for key in attr_group:
             for att in attr_group[key]:
                 self.att_assign[att] = key - 1
@@ -106,13 +95,11 @@ class ZSLNet(nn.Module):
 
         self.memory_max_size = 1024
         out_channel = self.part_num
-        #layers 
-        out_channel1 = 300
-
-        self.extract_1 =  torch.nn.Conv2d(256, out_channel1, kernel_size=8, stride=8)
-        self.extract_2 = torch.nn.Conv2d(512, out_channel1, kernel_size=4, stride=4)
-        self.extract_3 = torch.nn.Conv2d(1024, out_channel1, kernel_size=2, stride=2)
-        self.extract_4 = torch.nn.Conv2d(2048, out_channel1, kernel_size=1, stride=1)
+        #layers
+        self.extract_1 =  torch.nn.Conv2d(256, out_channel, kernel_size=8, stride=8)
+        self.extract_2 = torch.nn.Conv2d(512, out_channel, kernel_size=4, stride=4)
+        self.extract_3 = torch.nn.Conv2d(1024, out_channel, kernel_size=2, stride=2)
+        self.extract_4 = torch.nn.Conv2d(2048, out_channel, kernel_size=1, stride=1)
       
         self.contrastive_embedding = nn.Linear(self.attr_proto_size,cfg.MODEL.HID)
      
@@ -135,9 +122,13 @@ class ZSLNet(nn.Module):
         self.scale_semantic = cfg.MODEL.SCALE_SEMANTIC
         self.episilon = 0.1
         self.memory_max_size = 512
-        #        
-        self.transzero = TransZero(self.config, self.attribute, self.w2v).to(self.device)
-
+        #############
+        self.mhatt_self = MultiHeadGeometryAttention_self(d_model=150, d_k=150, d_v=150, h=1, dropout=0.4,
+                                                identity_map_reordering=False,
+                                                attention_module=None,
+                                                attention_module_kwargs=None)
+        self.layer_cal = nn.Sequential(nn.Linear(2048, 150))
+        self.layer_cal2 = nn.Sequential(nn.Linear(150, 2048))
 
 
     def conv_features(self, x):
@@ -147,6 +138,57 @@ class ZSLNet(nn.Module):
         x = self.backbone(x)
         return x
 
+    def attr_decorrelation(self, query):
+    
+       loss_sum = 0
+
+       for key in self.attr_group:
+           group = self.attr_group[key]
+           if query.ndim == 3:
+               proto_each_group = query[:,group,:]  # g1 * v
+               channel_l2_norm = torch.norm(proto_each_group, p=2, dim=1)
+           else:
+               proto_each_group = query[group, :]  # g1 * v
+               channel_l2_norm = torch.norm(proto_each_group, p=2, dim=0)
+           loss_sum += channel_l2_norm.mean()
+
+       loss_sum = loss_sum.float()/len(self.attr_group)
+
+       return loss_sum
+
+    def CPT(self, atten_map):
+        """
+
+        :param atten_map: N, L, W, H
+        :return:
+        """
+
+        N, L, W, H = atten_map.shape
+        xp = torch.tensor(list(range(W))).long().unsqueeze(1).to(self.device)
+        yp = torch.tensor(list(range(H))).long().unsqueeze(0).to(self.device)
+
+        xp = xp.repeat(1, H)
+        yp = yp.repeat(W, 1)
+
+        atten_map_t = atten_map.view(N, L, -1)
+        value, idx = atten_map_t.max(dim=-1)
+
+        tx = idx // H
+        ty = idx - H * tx
+
+        xp = xp.unsqueeze(0).unsqueeze(0)
+        yp = yp.unsqueeze(0).unsqueeze(0)
+        tx = tx.unsqueeze(-1).unsqueeze(-1)
+        ty = ty.unsqueeze(-1).unsqueeze(-1)
+
+        pos = (xp - tx) ** 2 + (yp - ty) ** 2
+
+        loss = atten_map * pos
+
+        loss = loss.reshape(N, -1).mean(-1)
+        loss = loss.mean()
+
+        return loss
 
     def attentionModule(self, x,seen_att):
 
@@ -156,37 +198,102 @@ class ZSLNet(nn.Module):
         x4 = self.layer4(x3)
         N, C, W, H = x4.shape
 
+
         # seen_att.size() torch.Size([150, 312])
         seen_att_normalized = F.normalize(seen_att,dim=-1)
+        # seen_att_normalized.size() torch.Size([150, 312])
+        parts_map = self.extract_1(x1) + self.extract_2(x2) + self.extract_3(x3) + self.extract_4(x4)
+        # parts_map size: torch.Size([8, 312, 14, 14])
 
+        ###############
+
+
+        ##################
+        global_semantic_feat = F.avg_pool2d(parts_map, kernel_size=(W, H)).squeeze()
+        # global_semantic_feat size : torch.Size([8, 312])
+        self.global_semantic_feat = F.normalize(global_semantic_feat,dim=-1)
+        # self.global_semantic_feat size : torch.Size([8, 312])
+        semantic_score = self.global_semantic_feat @ seen_att_normalized.T * self.scale_semantic
+        # I guess seen_att_normalized 150 312
+        # semantic_score size : torch.Size([8, 150])
+
+        #########################
+        # x4 size : torch.Size([8, 2048, 14, 14])
+        # x5 size : torch.Size([8, 2048, 196]))
         global_feat = F.avg_pool2d(x4, kernel_size=(W, H)).squeeze()
         global_feat = self.fc_proto(global_feat)
         global_feat = F.normalize(global_feat,dim=-1)
         # global_feat size : torch.Size([8, 2048])
+        cls_proto = self.proto_model(seen_att_normalized*np.sqrt(self.part_num),True)
+        # cls_proto.size()  torch.Size([150, 2048])
+        cls_proto = torch.nn.functional.normalize(cls_proto,p=2,dim=1)
+        # after normalize cls_proto.size()  torch.Size([150, 2048])
+        visual_score = torch.einsum('bd,nd->bn', global_feat, cls_proto) * self.scale
+        # global_feat.size()  torch.Size([8, 2048])
+        # visual_score.size()  torch.Size([8, 150])
 
-        # seen_att_normalized.size() torch.Size([150, 312])
-        parts_map = self.extract_1(x1) + self.extract_2(x2) + self.extract_3(x3) + self.extract_4(x4)
-        # parts_map size: torch.Size([8, 312, 14, 14]) -> (8, 300, 14, 14)
+        #############################
+
 
         att_weight = F.max_pool2d(parts_map,kernel_size=(W,H)).squeeze().detach()
-        # att_weight size :  torch.Size([8, 300])
+        # att_weight size :  torch.Size([8, 312])
         self.att_weight = att_weight.gt(self.atten_thr)
+
+        # parts_map size: torch.Size([8, 312, 14, 14])
         parts_map_flatten = parts_map.reshape(N,-1,W*H).softmax(dim=1)
-        # parts_map_flatten size : torch.Size([8, 300, 196])
-       
+        # parts_map_flatten size : torch.Size([8, 312, 196])
+
+       #######################
+
+        
+       ##############
+       # This is  attention
         x5 = x4.reshape(N,C,-1)
         # x4 size : torch.Size([8, 2048, 14, 14])
         # x5 size : torch.Size([8, 2048, 196]))
         part_feats = torch.einsum('blr,bvr->blv',parts_map_flatten,x5.detach())
-        # 8 300 196 , 8 2048 196 -> 8 300 2048
+        # 8 312 ? , 8 2048 ? -> 8 312 2048
+        part_feats = self.fc_proto(part_feats)
+        part_feats_si = part_feats
+        # part_feates size() :  torch.Size([8, 312, 2048])
 
-        out_package = self.transzero(parts_map)
-        tran_out = out_package['emed']
-        # embed : torch.size([8,312])
-        visual_score = tran_out @ seen_att_normalized.T * self.scale_semantic
-
+        ##############
+        # seen_att_normalized.size() torch.Size([150, 312])
+        # if unseen 50 312
         
-        return   part_feats, visual_score
+        h_attr_batch = seen_att_normalized #  torch.Size([150, 312])
+        # h_attr_batch size : torch.Size([8, 150, 312])
+        part_feats_si  =part_feats_si.permute(0,2,1)
+        # part_feats_si size() :  torch.Size([8, 2048, 312])
+        # part_feats_si.size()[2] : 150
+        q = part_feats_si # torch.Size([8, 2048, 312])
+        k = h_attr_batch # torch.Size([150, 312]))
+        v = h_attr_batch # torch.Size([8, 150, 312])
+   
+        att = torch.matmul(q,k)
+        att = torch.einsum('blr,vr->blv',q,k) # torch.Size([8, 2048, 150])
+        
+        # att.size : torch.Size([8, 2048, 150])        
+        att = torch.softmax(att, -1)
+        part_feats = torch.matmul(att,v ).permute(0,2,1)
+        # part_feates size() :  torch.Size([8, 312, 2048])
+        # part_feats = self.layer_cal2(att)
+
+        atten_attr = F.max_pool2d(part_feats, kernel_size=(W,H))
+        atten_attr = atten_attr.view(N, -1)
+        #  att = torch.matmul(q, k) / np.sqrt(self.d_k)
+        # att1 = self.mhatt_self(q,k,v)
+        # att1 size() :  torch.Size([8, 312, 150])
+        # part_feats = self.layer_cal2(att1)
+       
+
+        #########
+
+        self.visual_score_reverse = None
+        self.topk = None
+        self.cls_proto_reverse = None
+
+        return part_feats, visual_score, global_feat, semantic_score, cls_proto, parts_map, x4, atten_attr
         
     def forward(self, x, att=None, label=None, seen_att=None,att_unseen=None):
         if att is not None:
@@ -202,11 +309,7 @@ class ZSLNet(nn.Module):
         seen_att_normalized = F.normalize(seen_att,dim=-1)
         self.iters += 1
         feat = self.conv_features(x)
-        part_feats, visual_score  = self.attentionModule(feat,seen_att)
-        ##
-
-        part_feats = F.normalize(part_feats, dim=-1)
-        # part_feates size() :  torch.Size([8, 312, 2048])
+        part_feats, visual_score, global_feat, semantic_score, cls_proto, atten_map, global_atten_map, atten_attr = self.attentionModule(feat,seen_att)
        
         if not self.training:
             return visual_score
@@ -218,18 +321,35 @@ class ZSLNet(nn.Module):
         Lreg = torch.tensor(0).float().to(self.device)
         Lad = torch.tensor(0).float().to(self.device)
     
-        
-        
+        part_filter = self.att_weight&att_binary.bool()
+        part_feats = F.normalize(part_feats, dim=-1)
         att_proto = self.proto_model(F.normalize(self.attribute_vector,-1) * np.sqrt(self.part_num), False)
         att_proto = F.normalize(att_proto,dim=-1)
        
-
+        if part_filter.sum()>0:
+            attr_proto_dist = torch.cat([cosine_distance(part_feat, att_proto).unsqueeze(0) for part_feat in part_feats],dim=0)
+            index_pos = torch.arange(len(att_proto)).view(-1,1).expand(attr_proto_dist.size(0),-1,1).to(self.device)
+            tmp = torch.arange(len(att_proto))
+            index_neg = torch.cat([tmp[tmp!=i].unsqueeze(0) for i in range(len(att_proto))],dim=0).expand(attr_proto_dist.size(0),-1,-1).to(self.device)
+            pos_dists = attr_proto_dist.gather(2,index_pos).squeeze()
+            neg_dists = attr_proto_dist.gather(2,index_neg).squeeze()
+            L_proto += F.relu(pos_dists - self.alpha*neg_dists.min(dim=-1)[0]  + self.beta)[part_filter].mean()
 
         if self.part_num > self.attribute_num:
             att[:,-1] = 0.1
 
-        # Lcls += self.CLS_loss(visual_score, label)
-        Lcls += self.CLS_loss(visual_score, label)           
+        Lreg += self.Reg_loss(atten_attr, att)
+        Lcls += self.CLS_loss(visual_score, label)
+        Lcls_att += self.CLS_loss(semantic_score, label)
+        part_feats = part_feats[part_filter]
+        part_label = (torch.arange(self.part_num)[None, ...].repeat(len(att), 1).to(self.device))[part_filter].reshape(-1)
+        if len(part_label)>0 and len(torch.unique(part_label)) != len(part_label):
+            contrastive_embeddings = F.normalize(self.contrastive_embedding(part_feats),dim=-1)
+         
+            L_proto_align += self.contrast_loss(contrastive_embeddings,part_label)
+
+
+           
 
         scale = self.scale.item()
 
@@ -246,57 +366,89 @@ class ZSLNet(nn.Module):
 
         return loss_dict
 
+    def CPT(self, atten_map):
+       N, L, W, H = atten_map.shape
+       xp = torch.tensor(list(range(W))).long().unsqueeze(1).to(self.device)
+       yp = torch.tensor(list(range(H))).long().unsqueeze(0).to(self.device)
+
+       xp = xp.repeat(1, H)
+       yp = yp.repeat(W, 1)
+
+       atten_map_t = atten_map.view(N, L, -1)
+       value, idx = atten_map_t.max(dim=-1)
+
+       tx = idx // H
+       ty = idx - H * tx
+
+       xp = xp.unsqueeze(0).unsqueeze(0)
+       yp = yp.unsqueeze(0).unsqueeze(0)
+       tx = tx.unsqueeze(-1).unsqueeze(-1)
+       ty = ty.unsqueeze(-1).unsqueeze(-1)
+
+       pos = (xp - tx) ** 2 + (yp - ty) ** 2
+
+       loss = atten_map * pos
+
+       loss = loss.reshape(N, -1).mean(-1)
+       loss = loss.mean()
+
+       return loss
+
+
 
 class TransZero(nn.Module):
-    def __init__(self, config, att, init_w2v_att,
+    def __init__(self, config, att, init_w2v_att, seenclass, unseenclass,
                  is_bias=True, bias=1, is_conservative=True):
         super(TransZero, self).__init__()
         self.config = config
-        self.dim_f = config['dim_f']['value']
-        self.dim_v = config['dim_v']['value']
-        self.nclass = config['num_class']['value']
-
-        self.is_bias = False
+        self.dim_f = config.dim_f
+        self.dim_v = config.dim_v
+        self.nclass = config.num_class
+        self.seenclass = seenclass
+        self.unseenclass = unseenclass
+        self.is_bias = is_bias
         self.is_conservative = is_conservative
         # class-level semantic vectors
         self.att = nn.Parameter(F.normalize(att), requires_grad=False)
-        # dataloader.att(size) : torch.Size([200, 312])
-
         # GloVe features for attributes name
         self.V = nn.Parameter(F.normalize(init_w2v_att), requires_grad=True)
-
+        # for self-calibration
+        self.bias = nn.Parameter(torch.tensor(bias), requires_grad=False)
+        mask_bias = np.ones((1, self.nclass))
+        mask_bias[:, self.seenclass.cpu().numpy()] *= -1
+        self.mask_bias = nn.Parameter(torch.tensor(
+            mask_bias, dtype=torch.float), requires_grad=False)
         # mapping
         self.W_1 = nn.Parameter(nn.init.normal_(
-            torch.empty(300, 300)), requires_grad=True)
-
-            
+            torch.empty(self.dim_v, config.tf_common_dim)), requires_grad=True)
         # transformer
         self.transformer = Transformer(
-            ec_layer=config['tf_ec_layer']['value'],
-            dc_layer=config['tf_dc_layer']['value'],
-            dim_com=config['tf_common_dim']['value'],
-            dim_feedforward=config['tf_dim_feedforward']['value'],
-            dropout=config['tf_dropout']['value'],
-            SAtt=config['tf_SAtt']['value'],
-            heads=config['tf_heads']['value'],
-            aux_embed=config['tf_aux_embed']['value'])
+            ec_layer=config.tf_ec_layer,
+            dc_layer=config.tf_dc_layer,
+            dim_com=config.tf_common_dim,
+            dim_feedforward=config.tf_dim_feedforward,
+            dropout=config.tf_dropout,
+            SAtt=config.tf_SAtt,
+            heads=config.tf_heads,
+            aux_embed=config.tf_aux_embed)
         # for loss computation
         self.log_softmax_func = nn.LogSoftmax(dim=1)
         self.weight_ce = nn.Parameter(torch.eye(self.nclass), requires_grad=False)
         self.CLS_loss = nn.CrossEntropyLoss()
         self.layer_se = nn.Sequential(nn.AdaptiveAvgPool1d(1),
             Rearrange('... () -> ...'),
-            nn.Linear(config['tf_common_dim']['value'], self.nclass))
+            nn.Linear(config.tf_common_dim, self.nclass))
 
     def forward(self, input, from_img=False):
-        Fs = input
+        Fs = self.resnet101(input) if from_img else input
         # transformer-based visual-to-semantic embedding
         v2s_embed,Trans_vis = self.forward_feature_transformer(Fs)
         # classification
-        package = {'embed': v2s_embed,
+        package = {'pred': self.forward_attribute(v2s_embed),
+                   'embed': v2s_embed,
                    'Vis_feature' : Trans_vis}
         # Trans_vis size :  torch.Size([50, 196, 300])
-        # embed : torch.size([50,312])
+        package['S_pp'] = package['pred']
         return package
 
     def forward_feature_transformer(self, Fs):
@@ -316,8 +468,8 @@ class TransZero(nn.Module):
         # V_n size :  torch.Size([312, 300])
         # self.W_1 size :  torch.Size([300, 300])
         # Trans_out size :  torch.Size([50, 312, 300])
-        # embed : torch.size([50,312])
-        
+        # embed : torch.size([50,300])
+
         return embed, Trans_vis.permute(0,2,1)
 
     def forward_attribute(self, embed):
@@ -326,6 +478,14 @@ class TransZero(nn.Module):
         embed = embed + self.vec_bias
         return embed
 
+    def compute_loss_Self_Calibrate(self, in_package):
+        S_pp = in_package['pred']
+        Prob_all = F.softmax(S_pp, dim=-1)
+        Prob_unseen = Prob_all[:, self.unseenclass]
+        assert Prob_unseen.size(1) == len(self.unseenclass)
+        mass_unseen = torch.sum(Prob_unseen, dim=1)
+        loss_pmp = -torch.log(torch.mean(mass_unseen))
+        return loss_pmp
 
     def compute_aug_cross_entropy_Vis(self, in_package):
         Labels = in_package['batch_label']
@@ -347,6 +507,10 @@ class TransZero(nn.Module):
         if self.is_bias:
             S_pp = S_pp - self.vec_bias
 
+        if not self.is_conservative:
+            S_pp = S_pp[:, self.seenclass]
+            Labels = Labels[:, self.seenclass]
+            assert S_pp.size(1) == len(self.seenclass)
 
         Prob = self.log_softmax_func(S_pp)
 
@@ -366,11 +530,13 @@ class TransZero(nn.Module):
         
         loss_CE_Ve = self.compute_aug_cross_entropy_Vis(in_package)
         loss_CE = self.compute_aug_cross_entropy(in_package)
+        loss_cal = self.compute_loss_Self_Calibrate(in_package)
         loss_reg = self.compute_reg_loss(in_package)
 
-        loss =   loss_CE  + self.config.lambda_reg * loss_reg + 0.1 * loss_CE_Ve
+        loss =   loss_CE + self.config.lambda_ * \
+            loss_cal + self.config.lambda_reg * loss_reg + 0.1 * loss_CE_Ve
         out_package = {'loss': loss, 'loss_CE': loss_CE,
-                        'loss_reg': loss_reg , 'loss_CE_Ve' : loss_CE_Ve}
+                       'loss_cal': loss_cal, 'loss_reg': loss_reg , 'loss_CE_Ve' : loss_CE_Ve}
         return out_package
 
 
@@ -382,8 +548,8 @@ class Transformer(nn.Module):
         super(Transformer, self).__init__()
         # input embedding
         self.embed_cv = nn.Sequential(nn.Linear(in_dim_cv, dim_com))
-        # if aux_embed:
-        #     self.embed_cv_aux = nn.Sequential(nn.Linear(in_dim_cv, dim_com))
+        if aux_embed:
+            self.embed_cv_aux = nn.Sequential(nn.Linear(in_dim_cv, dim_com))
         self.embed_attr = nn.Sequential(nn.Linear(in_dim_attr, dim_com))
         # transformer encoder
         self.transformer_encoder = MultiLevelEncoder_woPad(N=ec_layer,
@@ -404,7 +570,7 @@ class Transformer(nn.Module):
 
     def forward(self, f_cv, f_attr):
         # linearly map to common dim
-        h_cv = f_cv.permute(0, 2, 1)
+        h_cv = self.embed_cv(f_cv.permute(0, 2, 1))
         h_attr = self.embed_attr(f_attr)
         h_attr_batch = h_attr.unsqueeze(0).repeat(f_cv.shape[0], 1, 1)
         # visual encoder
@@ -655,8 +821,8 @@ class ScaledDotProductGeometryAttention_self(nn.Module):
         b_s, nq = queries.shape[:2]
         nk = keys.shape[1]
         q = self.fc_q(queries).view(b_s, nq, self.h,
-                                    self.d_k).permute(0, 2, 1, 3)
-        k = self.fc_k(keys).view(b_s, nk, self.h, self.d_k).permute(0, 2, 3, 1)
+                                    self.d_k).permute(0, 2, 1, 3) # 8 312 1 150 -> 8 1 312 150  
+        k = self.fc_k(keys).view(b_s, nk, self.h, self.d_k).permute(0, 2, 3, 1) # 8 312 1 150 -> 8 1 150 312
         v = self.fc_v(values).view(b_s, nk, self.h,
                                    self.d_v).permute(0, 2, 1, 3)
         att = torch.matmul(q, k) / np.sqrt(self.d_k)
@@ -771,7 +937,6 @@ class PositionWiseFeedForward(nn.Module):
         return out
 
 
-
 def build_ZSLNet(cfg):
     dataset_name = cfg.DATASETS.NAME
     info = utils.get_attributes_info(dataset_name)
@@ -783,9 +948,6 @@ def build_ZSLNet(cfg):
 
     img_size = cfg.DATASETS.IMAGE_SIZE
 
-    cofig_path = 'config/CUB_GZSL.yaml'
-    with open(cofig_path) as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
 
     c,w,h = 2048, img_size//32, img_size//32
 
@@ -799,22 +961,17 @@ def build_ZSLNet(cfg):
 
     w2v_file = dataset_name+"_attribute.pkl"
     w2v_path = join(cfg.MODEL.ATTENTION.W2V_PATH, w2v_file)
-    
-    _, _, _, res = build_dataloader(cfg, is_distributed=True)
 
-    with open(w2v_path, 'rb') as f:
-        w2v = pickle.load(f)    
-    
+
+    # with open(w2v_path, 'rb') as f:
+    #     w2v = pickle.load(f)
+    w2v = None
 
     device = torch.device(cfg.MODEL.DEVICE)
-    w2v = torch.from_numpy(w2v).float().to(device)
-    
-    attribute = res['attribute']
-    attribute =torch.from_numpy(attribute).float().to(device)
 
     return ZSLNet(backbone=res101, img_size=img_size,
                   c=c, w=w, h=h, scale=scale,
                   attribute_num=attribute_num,
-                  attr_group=attr_group, attribute = attribute, w2v=w2v,dataset_name=dataset_name,config=config,
+                  attr_group=attr_group, w2v=w2v,dataset_name=dataset_name,
                   cls_num=cls_num, ucls_num=ucls_num,
                   device=device,cfg=cfg)

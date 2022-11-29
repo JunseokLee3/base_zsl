@@ -1,5 +1,3 @@
-dataset:
-  value: CUB
 num_class:
   value: 200
 num_attribute:
